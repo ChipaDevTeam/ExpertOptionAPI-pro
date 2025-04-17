@@ -1,0 +1,1865 @@
+Expert Option
+############################################################
+# Expert/__init__.py
+############################################################
+"""A Python wrapper for the ExpertOption API."""
+import logging
+
+def _setup_logging():
+    """Configure logging for the ExpertOption API module."""
+    logger = logging.getLogger(__name__)
+    logger.addHandler(logging.NullHandler())
+    websocket_logger = logging.getLogger("websockets")
+    websocket_logger.setLevel(logging.DEBUG)
+    websocket_logger.addHandler(logging.NullHandler())
+
+_setup_logging()
+
+############################################################
+# Expert/api.py
+############################################################
+"""Main API class for the ExpertOption API."""
+import asyncio
+import logging
+import time
+import json
+from typing import Dict, List, Optional
+from uuid import uuid4
+from Expert.ws.client import WebSocketClient
+from Expert.ws.channels.authenticate import AuthenticateChannel
+from Expert.ws.channels.ping import PingChannel
+from Expert.ws.channels.candles import CandlesChannel
+from Expert.ws.channels.buy import BuyChannel
+from Expert.ws.channels.history import HistoryChannel
+from Expert.ws.channels.traders_choice import TradersChoiceChannel
+from Expert.ws.objects.profile import Profile
+from Expert.ws.objects.candles import Candles
+from Expert.ws.objects.order import Order
+from Expert.constants import get_asset_id, get_asset_symbol, get_available_regions, get_default_multiple_action
+from Expert.utils import validate_asset_id, validate_symbol, get_next_expiration_time
+from Expert.exceptions import (
+    ConnectionError, InvalidAssetError, InvalidExpirationTimeError,
+    OrderPlacementError, DataFetchError
+)
+
+class ExpertOptionAPI:
+    """Main API class for interacting with the ExpertOption server."""
+    
+    def __init__(self, token: str, demo: bool = True, server_region: str = "wss://fr24g1us.expertoption.finance/ws/v40"):
+        """Initialize the API client.
+        
+        Args:
+            token: Authentication token for the ExpertOption server.
+            demo: True for demo mode, False for real trading.
+            server_region: WebSocket server URI.
+        """
+        self.token = token
+        self.demo = demo
+        self.server_region = server_region if server_region in get_available_regions() else "wss://fr24g1us.expertoption.finance/ws/v40"
+        self.websocket_client = WebSocketClient(self)
+        self.logger = logging.getLogger("ExpertOptionAPI")
+        self.profile = Profile()
+        self.candles = Candles()
+        self.active_assets: Dict[int, Dict] = {}
+        self.candle_cache: Dict[int, Dict] = {}
+        self.order_cache: Dict[int, Order] = {}
+        self.connected = False
+        self.assets_data = None
+        self.profile_data = None
+
+    async def connect(self, max_retries: int = 3, retry_delay: float = 5.0):
+        """Connect to the ExpertOption server and initialize the session with retries.
+        
+        Args:
+            max_retries: Maximum number of connection retries.
+            retry_delay: Delay between retries in seconds.
+        
+        Raises:
+            ConnectionError: If all retries fail.
+        """
+        if self.connected:
+            self.logger.info("Already connected to the server")
+            return
+        
+        for attempt in range(max_retries):
+            try:
+                self.logger.info(f"Connection attempt {attempt + 1}/{max_retries}")
+                await self.websocket_client.connect(self.server_region)
+                # Send multipleAction requests and fetch assets
+                await self.send_multiple_action()
+                await asyncio.sleep(1.0)  # Add delay to ensure responses are processed
+                await self.set_trading_mode()
+                await self.fetch_profile()
+                # Process assets data
+                self.logger.debug(f"Assets data type: {type(self.assets_data)}, content: {self.assets_data}")
+                if self.assets_data and isinstance(self.assets_data, dict):
+                    try:
+                        assets_list = self.assets_data.get("message", {}).get("assets", [])
+                        if not isinstance(assets_list, list):
+                            self.logger.error(f"Assets list is not a list: {assets_list}")
+                            raise ValueError("Assets data is invalid")
+                        # Merge new assets with existing ones
+                        for asset in assets_list:
+                            if asset.get("is_active") == 1:
+                                self.active_assets[asset["id"]] = asset
+                        self.logger.info(f"Merged {len(assets_list)} assets, total active assets: {len(self.active_assets)}")
+                        self.logger.debug(f"Active asset IDs: {list(self.active_assets.keys())}")
+                    except Exception as e:
+                        self.logger.error(f"Failed to process assets data: {str(e)}")
+                        raise DataFetchError(f"Failed to process assets data: {str(e)}")
+                else:
+                    self.logger.warning("No valid assets data received from multipleAction, trying fetch_assets")
+                    await self.fetch_assets()
+                self.connected = True
+                self.logger.info("Successfully connected to ExpertOption server")
+                asyncio.create_task(self._auto_ping())
+                return
+            except Exception as e:
+                self.logger.error(f"Connection attempt {attempt + 1} failed: {str(e)}", exc_info=True)
+                self.connected = False
+                await self.websocket_client.disconnect()
+                if attempt < max_retries - 1:
+                    self.logger.info(f"Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                else:
+                    raise ConnectionError(f"Connection failed after {max_retries} attempts: {str(e)}")
+
+    async def send_multiple_action(self):
+        """Send multipleAction requests similar to the old library and F12 data."""
+        try:
+            # First multipleAction request (matches F12, without defaultSubscribeCandles)
+            ns = str(uuid4())
+            payload1 = {
+                "action": "multipleAction",
+                "message": {
+                    "actions": [
+                        {"action": "userGroup", "ns": str(uuid4()), "token": self.token},
+                        {"action": "profile", "ns": str(uuid4()), "token": self.token},
+                        {"action": "assets", "ns": str(uuid4()), "token": self.token},
+                        {"action": "getCurrency", "ns": str(uuid4()), "token": self.token},
+                        {"action": "getCountries", "ns": str(uuid4()), "token": self.token},
+                        {"action": "environment", "message": {
+                            "supportedFeatures": ["achievements", "trade_result_share", "tournaments", "referral", "twofa", "inventory", "deposit_withdrawal_error_handling", "report_a_problem_form", "ftt_trade", "stocks_trade"],
+                            "supportedAbTests": ["tournament_glow", "floating_exp_time", "tutorial", "tutorial_account_type", "tutorial_account_type_reg", "hide_education_section", "in_app_update_android_2", "auto_consent_reg", "btn_finances_to_register", "battles_4th_5th_place_rewards", "show_achievements_bottom_sheet", "kyc_webview", "promo_story_priority", "force_lang_in_app", "one_click_deposit"],
+                            "supportedInventoryItems": ["riskless_deal", "profit", "eopoints", "tournaments_prize_x3", "mystery_box", "special_deposit_bonus", "cashback_offer"]
+                        }, "ns": str(uuid4()), "token": self.token},
+                        {"action": "setTimeZone", "message": {"timeZone": 180}, "ns": str(uuid4()), "token": self.token},
+                        {"action": "getCandlesTimeframes", "ns": str(uuid4()), "token": self.token}
+                    ]
+                },
+                "token": self.token,
+                "ns": ns
+            }
+            self.logger.debug(f"Sending first multipleAction payload: {json.dumps(payload1, indent=2)}")
+            await self.websocket_client.send(payload1)
+            self.logger.info("Sent first multipleAction request")
+            await asyncio.sleep(1.0)  # Wait for response
+
+            # Second multipleAction request (matches old library, without defaultSubscribeCandles)
+            payload2 = {
+                "action": "multipleAction",
+                "message": {
+                    "actions": [
+                        {"action": "userGroup", "ns": str(uuid4()), "token": self.token},
+                        {"action": "profile", "ns": str(uuid4()), "token": self.token},
+                        {"action": "assets", "message": {"mode": ["vanilla"], "subscribeMode": ["vanilla"]}, "ns": str(uuid4()), "token": self.token},
+                        {"action": "getCurrency", "ns": str(uuid4()), "token": self.token},
+                        {"action": "getCountries", "ns": str(uuid4()), "token": self.token},
+                        {"action": "environment", "ns": str(uuid4()), "token": self.token},
+                        {"action": "setTimeZone", "message": {"timeZone": -180}, "ns": str(uuid4()), "token": self.token},
+                        {"action": "getCandlesTimeframes", "ns": str(uuid4()), "token": self.token}
+                    ]
+                },
+                "token": self.token,
+                "ns": str(uuid4())
+            }
+            self.logger.debug(f"Sending second multipleAction payload: {json.dumps(payload2, indent=2)}")
+            await self.websocket_client.send(payload2)
+            self.logger.info("Sent second multipleAction request")
+            await asyncio.sleep(1.0)  # Wait for response
+
+            # Third multipleAction request (matches old library)
+            payload3 = {
+                "action": "multipleAction",
+                "message": {
+                    "actions": [
+                        {"action": "openOptions", "ns": str(uuid4()), "token": self.token},
+                        {"action": "tradeHistory", "message": {"index_from": 0, "count": 20, "is_demo": 1}, "ns": str(uuid4()), "token": self.token},
+                        {"action": "tradeHistory", "message": {"index_from": 0, "count": 20, "is_demo": 0}, "ns": str(uuid4()), "token": self.token},
+                        {"action": "getTournaments", "ns": str(uuid4()), "token": self.token},
+                        {"action": "getTournamentInfo", "ns": str(uuid4()), "token": self.token}
+                    ]
+                },
+                "token": self.token,
+                "ns": str(uuid4())
+            }
+            self.logger.debug(f"Sending third multipleAction payload: {json.dumps(payload3, indent=2)}")
+            await self.websocket_client.send(payload3)
+            self.logger.info("Sent third multipleAction request")
+        except Exception as e:
+            self.logger.error(f"Failed to send multipleAction requests: {str(e)}", exc_info=True)
+            raise
+
+    async def disconnect(self):
+        """Disconnect from the ExpertOption server."""
+        try:
+            self.connected = False  # Set connected to False before disconnecting
+            await self.websocket_client.disconnect()
+            self.logger.info("Disconnected from ExpertOption server")
+        except Exception as e:
+            self.logger.error(f"Failed to disconnect: {str(e)}", exc_info=True)
+
+    async def _auto_ping(self):
+        """Periodically send ping requests to keep the connection alive."""
+        ping_channel = PingChannel(self)
+        while self.connected:
+            try:
+                await ping_channel.send(self, {})
+                self.logger.debug("Sent ping request")
+                await asyncio.sleep(15)  # Increased interval to reduce load
+            except Exception as e:
+                self.logger.error(f"Error sending ping: {str(e)}", exc_info=True)
+                await asyncio.sleep(15)
+
+    async def set_trading_mode(self):
+        """Set the trading mode (demo or real)."""
+        try:
+            mode = 1 if self.demo else 0
+            payload = {"action": "setContext", "message": {"is_demo": mode}, "token": self.token, "ns": str(uuid4())}
+            self.logger.debug(f"Sending setContext payload: {json.dumps(payload, indent=2)}")
+            await self.websocket_client.send(payload)
+            self.logger.info(f"Trading mode set to {'demo' if self.demo else 'real'}")
+        except Exception as e:
+            self.logger.error(f"Failed to set trading mode: {str(e)}", exc_info=True)
+            raise DataFetchError(f"Failed to set trading mode: {str(e)}")
+
+    async def fetch_profile(self):
+        """Fetch user profile data from the server."""
+        try:
+            if self.profile_data:
+                profile_data = self.profile_data.get("message", {}).get("profile", {})
+                self.profile.demo_balance = profile_data.get("demo_balance", 0.0)
+                self.profile.real_balance = profile_data.get("balance", 0.0)
+                self.profile.user_id = profile_data.get("id")
+                self.profile.nickname = profile_data.get("name")
+                self.logger.info("User profile data fetched from cache")
+            else:
+                payload = {"action": "profile", "message": None, "ns": str(uuid4()), "token": self.token}
+                self.logger.debug(f"Sending profile payload: {json.dumps(payload, indent=2)}")
+                await self.websocket_client.send(payload)
+                response = await self.websocket_client.recv("profile", timeout=20.0)
+                self.profile_data = response
+                profile_data = response.get("message", {}).get("profile", {})
+                self.profile.demo_balance = profile_data.get("demo_balance", 0.0)
+                self.profile.real_balance = profile_data.get("balance", 0.0)
+                self.profile.user_id = profile_data.get("id")
+                self.profile.nickname = profile_data.get("name")
+                self.logger.info("User profile data fetched successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to fetch profile data: {str(e)}", exc_info=True)
+            raise DataFetchError(f"Failed to fetch profile data: {str(e)}")
+
+    async def fetch_assets(self):
+        """Fetch available assets data from the server (fallback)."""
+        try:
+            payload = {
+                "action": "assets",
+                "message": {"mode": ["vanilla", "binary"], "subscribeMode": ["vanilla"]},
+                "ns": str(uuid4()),
+                "token": self.token
+            }
+            self.logger.debug(f"Sending assets payload: {json.dumps(payload, indent=2)}")
+            await self.websocket_client.send(payload)
+            await asyncio.sleep(0.5)
+            response = await self.websocket_client.recv("assets", timeout=20.0)
+            self.assets_data = response
+            # Merge new assets with existing ones
+            assets_list = response.get("message", {}).get("assets", [])
+            for asset in assets_list:
+                if asset.get("is_active") == 1:
+                    self.active_assets[asset["id"]] = asset
+            self.logger.info(f"Merged {len(assets_list)} assets, total active assets: {len(self.active_assets)}")
+            self.logger.debug(f"Active asset IDs: {list(self.active_assets.keys())}")
+        except Exception as e:
+            self.logger.error(f"Failed to fetch assets data: {str(e)}", exc_info=True)
+            raise DataFetchError(f"Failed to fetch assets data: {str(e)}")
+
+    def get_balance(self) -> float:
+        """Get the current account balance.
+        
+        Returns:
+            The balance for the current mode (demo or real).
+        """
+        balance = self.profile.demo_balance if self.demo else self.profile.real_balance
+        self.logger.debug(f"Account balance: {balance}")
+        return balance
+
+    async def get_candles(self, asset_id: int, timeframes: List[int] = [0, 5]) -> Dict:
+        """Subscribe to real-time candle data for a specific asset.
+        
+        Args:
+            asset_id: The ID of the asset.
+            timeframes: List of timeframes (e.g., [0, 5] for tick and 5-second candles).
+        
+        Returns:
+            The candle data.
+        
+        Raises:
+            InvalidAssetError: If the asset is not active.
+            DataFetchError: If fetching candle data fails.
+        """
+        try:
+            if not validate_asset_id(asset_id, self.active_assets):
+                self.logger.error(f"Asset ID {asset_id} not found in active assets: {list(self.active_assets.keys())}")
+                raise InvalidAssetError(f"Asset ID {asset_id} is not active")
+            
+            candles_channel = CandlesChannel(self)
+            response = await candles_channel(asset_id, timeframes)
+            self.logger.debug(f"Candle response for asset ID {asset_id}: {response}")
+            
+            candle_data = response.get("message", {})
+            if not isinstance(candle_data, dict) or "candles" not in candle_data:
+                self.logger.error(f"Invalid candle data format for asset ID {asset_id}: {candle_data}")
+                raise DataFetchError(f"Invalid candle data format for asset ID {asset_id}")
+            
+            self.candle_cache[asset_id] = candle_data
+            self.candles.candles_data = candle_data
+            self.logger.info(f"Fetched candle data for asset ID {asset_id}")
+            return self.candle_cache[asset_id]
+        except Exception as e:
+            self.logger.error(f"Failed to fetch candle data for asset ID {asset_id}: {str(e)}", exc_info=True)
+            raise DataFetchError(f"Failed to fetch candle data: {str(e)}")
+
+    async def place_order(self, asset_id: int, amount: float, direction: str = "call") -> int:
+        """Place a trading order.
+        
+        Args:
+            asset_id: The ID of the asset.
+            amount: The investment amount.
+            direction: The trade direction ("call" or "put").
+        
+        Returns:
+            The order ID.
+        
+        Raises:
+            InvalidAssetError: If the asset is not active.
+            InvalidExpirationTimeError: If the expiration time is invalid.
+            OrderPlacementError: If order placement fails.
+        """
+        try:
+            if not validate_asset_id(asset_id, self.active_assets):
+                raise InvalidAssetError(f"Asset ID {asset_id} is not active")
+            
+            await self.get_candles(asset_id)
+            candle_data = self.candle_cache.get(asset_id, {})
+            self.logger.debug(f"Candle data for placing order: {candle_data}")
+            
+            exp_times = self.active_assets.get(asset_id, {}).get("rates", [{}])[0].get("expirations", [])
+            server_time = candle_data.get("candles", [{}])[0].get("t", int(time.time()))
+            
+            if not exp_times:
+                self.logger.warning("No valid expiration times found, using fallback")
+                exp_time = int(time.time()) + 60  # Fallback to 1 minute from now
+            else:
+                exp_time = get_next_expiration_time(exp_times, server_time)
+            
+            buy_channel = BuyChannel(self)
+            response = await buy_channel(asset_id, amount, direction, exp_time, self.demo)
+            options = response.get("message", {}).get("options", [])
+            if options:
+                order_id = options[0].get("id")
+                order = Order()
+                order.order_id = order_id
+                order.asset_id = asset_id
+                order.amount = amount
+                order.direction = direction
+                order.strike_time = server_time
+                order.exp_time = exp_time
+                self.order_cache[order_id] = order
+                self.logger.info(f"Order placed successfully for asset ID {asset_id}. Order ID: {order_id}")
+                return order_id
+            raise OrderPlacementError("Order placement failed: No options returned")
+        except Exception as e:
+            self.logger.error(f"Failed to place order for asset ID {asset_id}: {str(e)}", exc_info=True)
+            raise OrderPlacementError(f"Failed to place order: {str(e)}")
+
+    async def check_order_status(self, order_id: int, timeout: float = 60.0) -> Optional[Order]:
+        """Check the status of a trading order.
+        
+        Args:
+            order_id: The ID of the order to check.
+            timeout: Maximum time to wait for the result.
+        
+        Returns:
+            The order object with updated status and profit.
+        """
+        try:
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                try:
+                    response = await self.websocket_client.recv("expertOption", timeout=1.0)
+                    options = response.get("message", {}).get("options", [])
+                    for opt in options:
+                        if opt.get("id") == order_id:
+                            order = self.order_cache.get(order_id, Order())
+                            order.status = opt.get("status")
+                            order.profit = opt.get("profit", 0)
+                            self.logger.info(f"Order status for ID {order_id}: {opt}")
+                            return order
+                    await asyncio.sleep(1)
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    self.logger.error(f"Error checking order status for ID {order_id}: {str(e)}", exc_info=True)
+                    return None
+            self.logger.warning(f"Order ID {order_id} did not resolve within {timeout} seconds")
+            return None
+        except Exception as e:
+            self.logger.error(f"Failed to check order status for ID {order_id}: {str(e)}", exc_info=True)
+            return None
+
+    async def place_order_by_symbol(self, symbol: str, amount: float, direction: str = "call") -> int:
+        """Place a trading order using the asset symbol.
+        
+        Args:
+            symbol: The symbol of the asset (e.g., 'BTCUSD').
+            amount: The amount to invest.
+            direction: Trade direction ("call" or "put").
+        
+        Returns:
+            The order ID.
+        
+        Raises:
+            InvalidAssetError: If the symbol is invalid.
+        """
+        try:
+            if not validate_symbol(symbol):
+                raise InvalidAssetError(f"Symbol {symbol} not found")
+            asset_id = get_asset_id(symbol)
+            return await self.place_order(asset_id, amount, direction)
+        except Exception as e:
+            self.logger.error(f"Failed to place order by symbol {symbol}: {str(e)}", exc_info=True)
+            raise InvalidAssetError(f"Failed to place order by symbol: {str(e)}")
+
+    async def get_historical_candles(self, asset_id: int, periods: List[List[int]]) -> Dict:
+        """Fetch historical candle data for a specific asset.
+        
+        Args:
+            asset_id: The ID of the asset.
+            periods: List of time periods [[start, end], ...] in Unix timestamps.
+        
+        Returns:
+            The historical candle data.
+        
+        Raises:
+            InvalidAssetError: If the asset is not active.
+            DataFetchError: If fetching historical candle data fails.
+        """
+        try:
+            if not validate_asset_id(asset_id, self.active_assets):
+                self.logger.error(f"Asset ID {asset_id} not found in active assets: {list(self.active_assets.keys())}")
+                raise InvalidAssetError(f"Asset ID {asset_id} is not active")
+            
+            payload = {
+                "action": "assetHistoryCandles",
+                "message": {
+                    "assetid": asset_id,
+                    "periods": periods,
+                    "timeframes": [5]
+                },
+                "token": self.token,
+                "ns": str(uuid4())
+            }
+            self.logger.debug(f"Sending historical candles request: {json.dumps(payload, indent=2)}")
+            await self.websocket_client.send(payload)
+            response = await self.websocket_client.recv("assetHistoryCandles", timeout=20.0)
+            self.logger.debug(f"Received historical candles response: {response}")
+            
+            candle_data = response.get("message", {})
+            if not isinstance(candle_data, dict) or "candles" not in candle_data:
+                self.logger.error(f"Invalid historical candle data format for asset ID {asset_id}: {candle_data}")
+                raise DataFetchError(f"Invalid historical candle data format for asset ID {asset_id}")
+            
+            return candle_data
+        except Exception as e:
+            self.logger.error(f"Failed to fetch historical candle data for asset ID {asset_id}: {str(e)}", exc_info=True)
+            raise DataFetchError(f"Failed to fetch historical candle data: {str(e)}")
+
+    async def get_traders_choice(self, asset_id: int) -> Dict:
+        """Fetch traders' choice data for a specific asset.
+        
+        Args:
+            asset_id: The ID of the asset.
+        
+        Returns:
+            The traders' choice data.
+        
+        Raises:
+            InvalidAssetError: If the asset is not active.
+            DataFetchError: If fetching traders' choice data fails.
+        """
+        try:
+            if not validate_asset_id(asset_id, self.active_assets):
+                self.logger.error(f"Asset ID {asset_id} not found in active assets: {list(self.active_assets.keys())}")
+                raise InvalidAssetError(f"Asset ID {asset_id} is not active")
+            
+            traders_choice_channel = TradersChoiceChannel(self)
+            response = await traders_choice_channel(asset_id)
+            self.logger.debug(f"Traders' choice response for asset ID {asset_id}: {response}")
+            
+            choice_data = response.get("message", {})
+            if not isinstance(choice_data, dict):
+                self.logger.error(f"Invalid traders' choice data format for asset ID {asset_id}: {choice_data}")
+                raise DataFetchError(f"Invalid traders' choice data format for asset ID {asset_id}")
+            
+            return choice_data
+        except Exception as e:
+            self.logger.error(f"Failed to fetch traders' choice data for asset ID {asset_id}: {str(e)}", exc_info=True)
+            raise DataFetchError(f"Failed to fetch traders' choice data: {str(e)}")
+
+############################################################
+# Expert/constants.py
+############################################################
+"""Constants for the ExpertOption API."""
+from typing import Dict, List
+
+# Mapping of asset IDs to symbols
+ASSET_MAPPING: Dict[int, str] = {
+    142: "EURUSD_otc",
+    151: "AUDCAD",
+    152: "AUDJPY",
+    153: "AUDUSD",
+    154: "EURGBP",
+    155: "GBPUSD",
+    156: "NZDUSD",
+    157: "USDCAD",
+    158: "USDCHF",
+    159: "USDJPY",
+    160: "BTCUSD",
+    162: "ETHUSD",
+    163: "BTCLTC",
+    167: "BCHUSD",
+    168: "IOTAUSD",
+    170: "XAUTRY",
+    171: "XMRUSD",
+    172: "ZECUSD",
+    175: "ETCUSD",
+    176: "GOLD",
+    177: "OILBRENT",
+    178: "SILVER",
+    179: "EURUSD_otc",
+    180: "GBPUSD_otc",
+    181: "USDJPY_otc",
+    182: "USDCHF_otc",
+    183: "EURGBP_otc",
+    184: "AUDUSD_otc",
+    185: "USDCAD_otc",
+    186: "NZDUSD_otc",
+    187: "EURJPY_otc",
+    188: "EURCAD_otc",
+    189: "META",
+    190: "BABA",
+    191: "GOOGL",
+    192: "AAPL",
+    193: "AMZN",
+    194: "MSFT",
+    195: "TSLA",
+    196: "LMT",
+    197: "VRX",
+    199: "YUM",
+    200: "IBM",
+    201: "YHOO",
+    202: "MCD",
+    203: "DIS",
+    204: "F",
+    205: "CITI",
+    206: "GS",
+    207: "KO",
+    208: "BIDU",
+    209: "NFLX",
+    210: "USDNOK",
+    211: "EURAUD",
+    212: "EURCHF",
+    214: "GBPCAD",
+    216: "GBPCHF",
+    217: "EURJPY",
+    218: "AUDCHF",
+    219: "AUDNZD",
+    221: "PLATINUM",
+    229: "ALTINDEX",
+    230: "TOPCRYPTO",
+    231: "BINANCEINDEX",
+    232: "BTCTRY",
+    233: "USDINDEX",
+    239: "QQQ",
+    240: "SMARTY",
+    247: "COPPER",
+    252: "SP500",
+    253: "TOTALSTOCK",
+    254: "EMERGINGETF",
+    255: "RUSSELL2000",
+    256: "GOLDETF",
+    257: "TREASURYBOND",
+    258: "DEVETFS",
+    259: "JAPANETF",
+    260: "USOILETF",
+    262: "TECHETF",
+    263: "FINANCIALETF",
+    264: "ENERGYETF",
+    265: "REALESTATEETF",
+    266: "MATERIALSECTOR",
+    272: "INDIAINDEX",
+    276: "CRICKETINDEX",
+    277: "CAMELINDEX",
+    278: "FOOTBALLINDEX",
+    279: "CISCO",
+    280: "NVIDIA",
+    281: "XOM",
+    282: "PG",
+    283: "GM",
+    284: "NIKE",
+    285: "AIINDEX",
+    286: "LUXURYINDEX",
+    316: "TRUMP",
+}
+
+# Reverse mapping for symbol to ID
+SYMBOL_TO_ID: Dict[str, int] = {v: k for k, v in ASSET_MAPPING.items()}
+
+# WebSocket server regions
+REGIONS: Dict[str, str] = {
+    "EUROPE": "wss://fr24g1eu.expertoption.com/",
+    "INDIA": "wss://fr24g1in.expertoption.com/",
+    "HONG_KONG": "wss://fr24g1hk.expertoption.com/",
+    "SINGAPORE": "wss://fr24g1sg.expertoption.com/",
+    "UNITED_STATES": "wss://fr24g1us.expertoption.com/",
+}
+
+def get_asset_id(symbol: str) -> int:
+    """Retrieve asset ID from symbol.
+    
+    Args:
+        symbol: The asset symbol (e.g., 'EURUSD_otc').
+    
+    Returns:
+        The corresponding asset ID or None if not found.
+    """
+    return SYMBOL_TO_ID.get(symbol.upper())
+
+def get_asset_symbol(asset_id: int) -> str:
+    """Retrieve asset symbol from ID.
+    
+    Args:
+        asset_id: The asset ID.
+    
+    Returns:
+        The corresponding asset symbol or None if not found.
+    """
+    return ASSET_MAPPING.get(asset_id)
+
+def get_available_regions() -> List[str]:
+    """Return list of available server regions.
+    
+    Returns:
+        List of WebSocket server URIs.
+    """
+    return list(REGIONS.values())
+
+def get_default_multiple_action(token: str) -> Dict:
+    """Generate default data for multiple action request.
+    
+    Args:
+        token: API authentication token.
+    
+    Returns:
+        Dictionary containing the request data.
+    """
+    return {
+        "token": token,
+        "v": 18,
+        "action": "multipleAction",
+        "message": {
+            "token": token,
+            "actions": [
+                {"action": "getCountries", "message": None, "ns": None, "v": 18, "token": token},
+                {"action": "getCurrency", "message": None, "ns": None, "v": 18, "token": token},
+                {"action": "profile", "message": None, "ns": None, "v": 18, "token": token},
+                {"action": "environment", "message": None, "ns": None, "v": 18, "token": token},
+                {"action": "assets", "message": {"mode": ["vanilla", "binary"], "subscribeMode": ["vanilla"]}, "ns": None, "v": 18, "token": token},
+                {"action": "openOptions", "message": None, "ns": None, "v": 18, "token": token},
+                {"action": "userGroup", "message": None, "ns": None, "v": 18, "token": token},
+                {"action": "setTimeZone", "message": {"timeZone": 360}, "ns": None, "v": 18, "token": token},
+                {"action": "historySteps", "message": None, "ns": None, "v": 18, "token": token},
+                {"action": "tradeHistory", "message": {"mode": ["binary", "vanilla"], "count": 100, "index_from": 0}, "ns": None, "v": 18, "token": token},
+            ],
+        },
+    }
+
+############################################################
+# Expert/exceptions.py
+############################################################
+"""Custom exceptions for the ExpertOption API."""
+
+class ExpertOptionError(Exception):
+    """Base exception for ExpertOption API errors."""
+    pass
+
+class ConnectionError(ExpertOptionError):
+    """Raised when WebSocket connection fails."""
+    pass
+
+class AuthenticationError(ExpertOptionError):
+    """Raised when authentication with the server fails."""
+    pass
+
+class InvalidAssetError(ExpertOptionError):
+    """Raised when an invalid or inactive asset is used."""
+    pass
+
+class InvalidExpirationTimeError(ExpertOptionError):
+    """Raised when an invalid expiration time is provided."""
+    pass
+
+class OrderPlacementError(ExpertOptionError):
+    """Raised when order placement fails."""
+    pass
+
+class DataFetchError(ExpertOptionError):
+    """Raised when fetching data (e.g., candles, profile) fails."""
+    pass
+
+############################################################
+# Expert/indicators.py
+############################################################
+"""Technical indicators for the ExpertOption API."""
+import numpy as np
+import logging
+from typing import Dict, List, Optional
+from Expert.api import ExpertOptionAPI
+from Expert.exceptions import InvalidAssetError, OrderPlacementError
+
+class AlligatorIndicator:
+    """Alligator Indicator for analyzing market trends and generating trading signals."""
+    
+    def __init__(self, candle_data: Dict):
+        """Initialize the Alligator Indicator with candle data.
+        
+        Args:
+            candle_data: Candle data dictionary from the API.
+        """
+        self.logger = logging.getLogger("AlligatorIndicator")
+        self.prices = self._extract_closing_prices(candle_data)
+        if self.prices:
+            self.jaw = self._calculate_sma(13, 8)
+            self.teeth = self._calculate_sma(8, 5)
+            self.lips = self._calculate_sma(5, 3)
+        else:
+            self.logger.warning("No closing prices extracted from candle data")
+            self.jaw = self.teeth = self.lips = []
+
+    def _extract_closing_prices(self, candle_data: Dict) -> List[float]:
+        """Extract closing prices from candle data.
+        
+        Args:
+            candle_data: Candle data dictionary.
+        
+        Returns:
+            List of closing prices.
+        """
+        prices = []
+        try:
+            for candle in candle_data.get("candles", []):
+                for period in candle.get("periods", []):
+                    for data in period[1]:
+                        closing_price = data[3]
+                        prices.append(closing_price)
+        except Exception as e:
+            self.logger.error(f"Error extracting closing prices: {e}")
+        return prices
+
+    def _calculate_sma(self, period: int, shift: int) -> np.ndarray:
+        """Calculate Smoothed Moving Average.
+        
+        Args:
+            period: Period for the moving average.
+            shift: Shift for the moving average.
+        
+        Returns:
+            Smoothed moving average values as a NumPy array.
+        """
+        if not self.prices:
+            return np.array([])
+        sma = np.convolve(self.prices, np.ones(period), "valid") / period
+        return np.concatenate((np.full(shift, np.nan), sma))
+
+    async def evaluate_market_trend(self, api: ExpertOptionAPI, asset_id: int = 240, amount: float = 1.0) -> str:
+        """Evaluate market conditions and place a trade if conditions are met.
+        
+        Args:
+            api: ExpertOptionAPI instance for placing orders.
+            asset_id: The ID of the asset to trade.
+            amount: The amount to invest in the trade.
+        
+        Returns:
+            Market signal ("Buy signal executed", "Sell signal executed", "Hold", or "Not enough data").
+        
+        Raises:
+            InvalidAssetError: If the asset is not active.
+            OrderPlacementError: If placing the order fails.
+        """
+        if len(self.jaw) < 2 or len(self.teeth) < 2 or len(self.lips) < 2:
+            self.logger.warning("Not enough data for Alligator Indicator analysis")
+            return "Not enough data"
+
+        last_order = self.jaw[-1] > self.teeth[-1] > self.lips[-1]
+        prev_order = self.jaw[-2] > self.teeth[-2] > self.lips[-2]
+
+        if not prev_order and last_order:
+            try:
+                order_id = await api.place_order(asset_id, amount, "call")
+                self.logger.info(f"Buy signal executed for asset ID {asset_id}, order ID: {order_id}")
+                return "Buy signal executed"
+            except Exception as e:
+                self.logger.error(f"Failed to execute buy order: {e}")
+                raise OrderPlacementError(f"Failed to execute buy order: {e}")
+
+        if prev_order and not last_order:
+            try:
+                order_id = await api.place_order(asset_id, amount, "put")
+                self.logger.info(f"Sell signal executed for asset ID {asset_id}, order ID: {order_id}")
+                return "Sell signal executed"
+            except Exception as e:
+                self.logger.error(f"Failed to execute sell order: {e}")
+                raise OrderPlacementError(f"Failed to execute sell order: {e}")
+
+        self.logger.debug("No trading signal generated. Holding position.")
+        return "Hold"
+
+class RSIIndicator:
+    """Relative Strength Index (RSI) for analyzing market conditions."""
+    
+    def __init__(self, candle_data: Dict, period: int = 14):
+        """Initialize the RSI Indicator with candle data.
+        
+        Args:
+            candle_data: Candle data dictionary from the API.
+            period: Number of periods for RSI calculation.
+        """
+        self.logger = logging.getLogger("RSIIndicator")
+        self.period = period
+        self.prices = self._extract_closing_prices(candle_data)
+
+    def _extract_closing_prices(self, candle_data: Dict) -> List[float]:
+        """Extract closing prices from candle data.
+        
+        Args:
+            candle_data: Candle data dictionary.
+        
+        Returns:
+            List of closing prices.
+        """
+        prices = []
+        try:
+            for candle in candle_data.get("candles", []):
+                for period in candle.get("periods", []):
+                    for data in period[1]:
+                        closing_price = data[3]
+                        prices.append(closing_price)
+        except Exception as e:
+            self.logger.error(f"Error extracting closing prices: {e}")
+        return prices
+
+    def calculate_rsi(self) -> Optional[float]:
+        """Calculate the Relative Strength Index (RSI).
+        
+        Returns:
+            RSI value or None if insufficient data.
+        """
+        if len(self.prices) < self.period:
+            self.logger.warning(f"Insufficient data for RSI calculation. Need at least {self.period} prices, got {len(self.prices)}")
+            return None
+
+        try:
+            changes = np.diff(self.prices)
+            gains = np.where(changes > 0, changes, 0)
+            losses = np.where(changes < 0, -changes, 0)
+
+            avg_gain = np.mean(gains[:self.period])
+            avg_loss = np.mean(losses[:self.period])
+
+            for i in range(self.period, len(gains)):
+                avg_gain = (avg_gain * (self.period - 1) + gains[i]) / self.period
+                avg_loss = (avg_loss * (self.period - 1) + losses[i]) / self.period
+
+            if avg_loss == 0:
+                self.logger.debug("No losses recorded. RSI set to 100")
+                return 100
+
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+            self.logger.debug(f"Calculated RSI: {rsi}")
+            return rsi
+        except Exception as e:
+            self.logger.error(f"Error calculating RSI: {e}")
+            return None
+
+    def evaluate_market_condition(self, overbought_threshold: float = 70, oversold_threshold: float = 30) -> str:
+        """Evaluate if the market is overbought or oversold based on RSI.
+        
+        Args:
+            overbought_threshold: RSI threshold for overbought condition.
+            oversold_threshold: RSI threshold for oversold condition.
+        
+        Returns:
+            Market condition ("Overbought", "Oversold", "Neutral", or "Not enough data").
+        """
+        rsi = self.calculate_rsi()
+        if rsi is None:
+            return "Not enough data"
+        if rsi > overbought_threshold:
+            self.logger.debug(f"RSI {rsi} indicates overbought condition")
+            return "Overbought"
+        if rsi < oversold_threshold:
+            self.logger.debug(f"RSI {rsi} indicates oversold condition")
+            return "Oversold"
+        self.logger.debug(f"RSI {rsi} indicates neutral condition")
+        return "Neutral"
+
+    async def execute_rsi_strategy(self, api: ExpertOptionAPI, asset_id: int = 240, amount: float = 1.0,
+                                  overbought_threshold: float = 70, oversold_threshold: float = 30) -> str:
+        """Execute a trading strategy based on RSI signals.
+        
+        Args:
+            api: ExpertOptionAPI instance for placing orders.
+            asset_id: The ID of the asset to trade.
+            amount: The amount to invest in the trade.
+            overbought_threshold: RSI threshold for overbought condition.
+            oversold_threshold: RSI threshold for oversold condition.
+        
+        Returns:
+            Trading signal ("Buy signal executed", "Sell signal executed", "Hold", or "Not enough data").
+        
+        Raises:
+            InvalidAssetError: If the asset is not active.
+            OrderPlacementError: If placing the order fails.
+        """
+        condition = self.evaluate_market_condition(overbought_threshold, oversold_threshold)
+        if condition == "Not enough data":
+            return condition
+
+        if condition == "Oversold":
+            try:
+                order_id = await api.place_order(asset_id, amount, "call")
+                self.logger.info(f"Buy signal executed for asset ID {asset_id} (RSI oversold), order ID: {order_id}")
+                return "Buy signal executed"
+            except Exception as e:
+                self.logger.error(f"Failed to execute buy order: {e}")
+                raise OrderPlacementError(f"Failed to execute buy order: {e}")
+
+        if condition == "Overbought":
+            try:
+                order_id = await api.place_order(asset_id, amount, "put")
+                self.logger.info(f"Sell signal executed for asset ID {asset_id} (RSI overbought), order ID: {order_id}")
+                return "Sell signal executed"
+            except Exception as e:
+                self.logger.error(f"Failed to execute sell order: {e}")
+                raise OrderPlacementError(f"Failed to execute sell order: {e}")
+
+        return "Hold"
+
+############################################################
+# Expert/utils.py
+############################################################
+"""Utility functions for the ExpertOption API."""
+import logging
+import time
+from typing import List
+
+logger = logging.getLogger("ExpertOptionUtils")
+
+def validate_asset_id(asset_id: int, active_assets: dict) -> bool:
+    """Validate if an asset ID is active.
+    
+    Args:
+        asset_id: The ID of the asset.
+        active_assets: Dictionary of active assets.
+    
+    Returns:
+        True if the asset is active, False otherwise.
+    """
+    return asset_id in active_assets
+
+def validate_symbol(symbol: str) -> bool:
+    """Validate if a symbol is valid.
+    
+    Args:
+        symbol: The symbol to validate (e.g., 'BTCUSD').
+    
+    Returns:
+        True if the symbol is valid, False otherwise.
+    """
+    from Expert.constants import get_asset_id
+    try:
+        get_asset_id(symbol)
+        return True
+    except KeyError:
+        return False
+
+def validate_expiration_time(expiration_time: int, server_time: int) -> bool:
+    """Validate if an expiration time is valid.
+    
+    Args:
+        expiration_time: The expiration time to validate (Unix timestamp).
+        server_time: Current server time (Unix timestamp).
+    
+    Returns:
+        True if the expiration time is valid (in the future), False otherwise.
+    """
+    if not isinstance(expiration_time, int) or not isinstance(server_time, int):
+        logger.error(f"Invalid types: expiration_time={type(expiration_time)}, server_time={type(server_time)}")
+        return False
+    
+    if expiration_time <= server_time:
+        logger.warning(f"Expiration time {expiration_time} is not in the future (server time: {server_time})")
+        return False
+    
+    # Additional validation: ensure expiration time is within a reasonable range (e.g., next 24 hours)
+    max_expiration = server_time + 86400  # 24 hours from server time
+    if expiration_time > max_expiration:
+        logger.warning(f"Expiration time {expiration_time} is too far in the future (max: {max_expiration})")
+        return False
+    
+    logger.debug(f"Expiration time {expiration_time} is valid")
+    return True
+
+def get_next_expiration_time(exp_times: List[int], server_time: int) -> int:
+    """Get the next valid expiration time.
+    
+    Args:
+        exp_times: List of expiration times.
+        server_time: Current server time.
+    
+    Returns:
+        The next valid expiration time.
+    """
+    logger.debug(f"Expiration times: {exp_times}, Server time: {server_time}")
+    
+    if not exp_times:
+        logger.warning("No valid expiration times found, using fallback")
+        return server_time + 60  # Fallback to 1 minute from now
+    
+    valid_times = [t for t in exp_times if t > server_time]
+    if not valid_times:
+        logger.warning("No future expiration times found, using fallback")
+        return server_time + 60
+    
+    next_time = min(valid_times)
+    logger.debug(f"Selected next expiration time: {next_time}")
+    return next_time
+
+############################################################
+# Expert/ws/__init__.py
+############################################################
+Empty
+
+############################################################
+# Expert/ws/client.py
+############################################################
+"""WebSocket client for the ExpertOption API."""
+import asyncio
+import logging
+import websockets
+import json
+from typing import Dict, Optional
+from Expert.exceptions import ConnectionError
+
+class WebSocketClient:
+    """WebSocket client for communicating with the ExpertOption server."""
+    
+    def __init__(self, api):
+        """Initialize the WebSocket client.
+        
+        Args:
+            api: The ExpertOption API instance.
+        """
+        self.api = api
+        self.websocket: Optional[websockets.WebSocketClientProtocol] = None
+        self.logger = logging.getLogger("ExpertOptionWebSocketClient")
+        self.message_queue: Dict[str, asyncio.Queue] = {}
+        self.connected = False
+
+    async def connect(self, uri: str):
+        """Connect to the WebSocket server.
+        
+        Args:
+            uri: The WebSocket server URI.
+        
+        Raises:
+            ConnectionError: If the connection fails.
+        """
+        try:
+            self.logger.info(f"Connecting to WebSocket server: {uri}")
+            headers = {
+                "Origin": "https://app.expertoption.com",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Sec-WebSocket-Extensions": "permessage-deflate; client_max_window_bits"
+            }
+            self.websocket = await websockets.connect(uri, ping_interval=5, ping_timeout=20, extra_headers=headers)
+            self.connected = True
+            self.logger.info("WebSocket connection established successfully")
+            asyncio.create_task(self._receive_messages())
+        except Exception as e:
+            self.logger.error(f"Failed to connect to WebSocket server: {str(e)}", exc_info=True)
+            self.connected = False
+            raise ConnectionError(f"Failed to connect to WebSocket server: {str(e)}")
+
+    async def disconnect(self):
+        """Disconnect from the WebSocket server."""
+        try:
+            if self.websocket and self.connected:
+                await self.websocket.close()
+                self.connected = False
+                self.logger.info("WebSocket connection closed")
+        except Exception as e:
+            self.logger.error(f"Failed to disconnect from WebSocket server: {str(e)}", exc_info=True)
+
+    async def send(self, payload: Dict):
+        """Send a message to the WebSocket server.
+        
+        Args:
+            payload: The message payload to send.
+        
+        Raises:
+            ConnectionError: If not connected or sending fails.
+        """
+        try:
+            if not self.connected or not self.websocket:
+                raise ConnectionError("Not connected to WebSocket server")
+            await self.websocket.send(json.dumps(payload))
+            self.logger.debug(f"Sent message: {json.dumps(payload, indent=2)}")
+        except Exception as e:
+            self.logger.error(f"Failed to send message: {str(e)}", exc_info=True)
+            raise ConnectionError(f"Failed to send message: {str(e)}")
+
+    async def recv(self, action: str, timeout: float = 20.0) -> Dict:
+        """Receive a message for a specific action.
+        
+        Args:
+            action: The action to filter messages by.
+            timeout: Maximum time to wait for the message.
+        
+        Returns:
+            The received message.
+        
+        Raises:
+            asyncio.TimeoutError: If no message is received within the timeout.
+        """
+        try:
+            if action not in self.message_queue:
+                self.message_queue[action] = asyncio.Queue()
+            return await asyncio.wait_for(self.message_queue[action].get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            self.logger.error(f"Timeout waiting for message with action: {action}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Failed to receive message for action {action}: {str(e)}", exc_info=True)
+            raise
+
+    async def _receive_messages(self):
+        """Continuously receive messages from the WebSocket server."""
+        try:
+            while self.connected and self.websocket:
+                message = await self.websocket.recv()
+                try:
+                    data = json.loads(message)
+                    action = data.get("action")
+                    ns = data.get("ns")
+                    self.logger.debug(f"Received message: {json.dumps(data, indent=2)}")
+                    
+                    # Store profile and assets data
+                    if action == "profile":
+                        self.api.profile_data = data
+                        self.logger.info(f"Stored profile data from multipleAction: {data}")
+                    elif action == "assets":
+                        self.api.assets_data = data
+                        self.logger.info(f"Stored assets data from multipleAction: {data}")
+                    
+                    # Queue the message for specific action
+                    if action in self.message_queue:
+                        await self.message_queue[action].put(data)
+                except json.JSONDecodeError:
+                    self.logger.warning(f"Received non-JSON message: {message}")
+                except Exception as e:
+                    self.logger.error(f"Error processing received message: {str(e)}", exc_info=True)
+        except websockets.exceptions.ConnectionClosed as e:
+            self.logger.warning(f"WebSocket connection closed: {str(e)}")
+            self.connected = False
+            await self.disconnect()
+        except Exception as e:
+            self.logger.error(f"Error in receiving messages: {str(e)}", exc_info=True)
+            self.connected = False
+            await self.disconnect()
+
+############################################################
+# Expert/ws/channels/__init__.py
+############################################################
+Empty
+
+############################################################
+# Expert/ws/channels/authenticate.py
+############################################################
+"""Channel for authenticating with the ExpertOption server."""
+from Expert.ws.channels.base import BaseChannel
+from uuid import uuid4
+
+class AuthenticateChannel(BaseChannel):
+    """Channel for authenticating with the ExpertOption server."""
+    
+    async def __call__(self) -> dict:
+        """Authenticate with the server using the provided token.
+        
+        Returns:
+            The server response containing authentication details.
+        """
+        payload = {
+            "action": "authenticate",
+            "message": {
+                "token": self.api.token
+            },
+            "ns": str(uuid4())
+        }
+        self.logger.debug(f"Sending authentication request: {payload}")
+        await self.api.websocket_client.send(payload)
+        
+        response = await self.api.websocket_client.recv("authenticate", timeout=20.0)
+        self.logger.debug(f"Received authentication response: {response}")
+        return response
+
+############################################################
+# Expert/ws/channels/base.py
+############################################################
+"""Base channel class for WebSocket channels."""
+import logging
+from typing import Any, Dict
+
+class BaseChannel:
+    """Base class for WebSocket channels."""
+    
+    def __init__(self, api):
+        """Initialize the base channel.
+        
+        Args:
+            api: The ExpertOption API instance.
+        """
+        self.api = api
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+    async def __call__(self, *args, **kwargs) -> Dict:
+        """Execute the channel logic.
+        
+        This method should be overridden by subclasses.
+        
+        Returns:
+            The server response as a dictionary.
+        
+        Raises:
+            NotImplementedError: If not overridden by a subclass.
+        """
+        raise NotImplementedError("Subclasses must implement __call__ method")
+
+############################################################
+# Expert/ws/channels/buy.py
+############################################################
+"""Buy channel for placing trading orders."""
+import logging
+import time
+from typing import Dict, Any
+from uuid import uuid4
+from Expert.ws.channels.base import BaseChannel
+from Expert.utils import validate_asset_id, validate_expiration_time
+
+class BuyChannel(BaseChannel):
+    """Channel for placing trading orders."""
+    
+    def __init__(self, api):
+        """Initialize the buy channel.
+        
+        Args:
+            api: The ExpertOption API instance.
+        """
+        super().__init__(api)
+        self.logger = logging.getLogger("BuyChannel")
+    
+    async def __call__(self, asset_id: int, amount: float, direction: str, exp_time: int, is_demo: bool) -> Dict:
+        """Place a trading order.
+        
+        Args:
+            asset_id: The ID of the asset.
+            amount: The investment amount.
+            direction: The trade direction ("call" or "put").
+            exp_time: The expiration time of the order.
+            is_demo: True for demo mode, False for real trading.
+        
+        Returns:
+            The response from the server.
+        """
+        payload = {
+            "action": "expertOption",
+            "message": {
+                "options": [
+                    {
+                        "amount": amount,
+                        "asset_id": asset_id,
+                        "direction": direction,
+                        "expired": exp_time,
+                        "is_demo": 1 if is_demo else 0,
+                        "strike_time": int(time.time())  # Use current time as fallback
+                    }
+                ]
+            },
+            "token": self.api.token,
+            "ns": str(uuid4())
+        }
+        self.logger.debug(f"Sending buy request: {payload}")
+        await self.api.websocket_client.send(payload)
+        response = await self.api.websocket_client.recv("expertOption", timeout=20.0)
+        self.logger.debug(f"Received buy response: {response}")
+        return response
+
+############################################################
+# Expert/ws/channels/candles.py
+############################################################
+"""Candles channel for subscribing to real-time candle data."""
+import logging
+from typing import Dict, List
+from uuid import uuid4
+from Expert.ws.channels.base import BaseChannel
+
+class CandlesChannel(BaseChannel):
+    """Channel for subscribing to real-time candle data."""
+    
+    def __init__(self, api):
+        """Initialize the candles channel.
+        
+        Args:
+            api: The ExpertOption API instance.
+        """
+        super().__init__(api)
+        self.logger = logging.getLogger("CandlesChannel")
+    
+    async def __call__(self, asset_id: int, timeframes: List[int]) -> Dict:
+        """Subscribe to candle data for a specific asset.
+        
+        Args:
+            asset_id: The ID of the asset.
+            timeframes: List of timeframes to subscribe to (e.g., [0, 5]).
+        
+        Returns:
+            The candle data response.
+        """
+        payload = {
+            "action": "subscribeCandles",
+            "message": {
+                "assetsIds": [asset_id],
+                "timeframes": timeframes
+            },
+            "token": self.api.token,
+            "ns": str(uuid4())
+        }
+        self.logger.debug(f"Sending candles subscription request: {payload}")
+        await self.api.websocket_client.send(payload)
+        response = await self.api.websocket_client.recv("candles", timeout=20.0)
+        if response.get("action") == "error":
+            self.logger.error(f"Received error response: {response}")
+            raise ValueError(f"Server error: {response.get('message')}")
+        self.logger.debug(f"Received candles response: {response}")
+        return response
+
+############################################################
+# Expert/ws/channels/history.py
+############################################################
+"""History channel for the ExpertOption API."""
+from typing import List
+from Expert.ws.channels.base import BaseChannel
+from Expert.exceptions import InvalidAssetError
+from Expert.utils import validate_asset_id
+
+class HistoryChannel(BaseChannel):
+    """Channel for fetching historical candle data."""
+    
+    name = "history"
+    
+    async def __call__(self, asset_id: int, periods: List[List[int]], timeframe: int = 5):
+        """Fetch historical candle data for a specific asset.
+        
+        Args:
+            asset_id: The ID of the asset.
+            periods: List of time periods (e.g., [[start_time, end_time], ...]).
+            timeframe: Candle timeframe (e.g., 5 for 5-second candles).
+        
+        Returns:
+            The historical candle data response.
+        
+        Raises:
+            InvalidAssetError: If the asset is not active.
+        """
+        if not validate_asset_id(asset_id, self.api.active_assets):
+            raise InvalidAssetError(f"Asset ID {asset_id} is not active")
+        
+        message = {
+            "assetid": asset_id,
+            "periods": periods,
+            "timeframes": [timeframe]
+        }
+        return await self.send_request("assetHistoryCandles", message)
+
+############################################################
+# Expert/ws/channels/ping.py
+############################################################
+"""Ping channel for maintaining WebSocket connection."""
+import logging
+from typing import Dict, Any
+from uuid import uuid4
+from Expert.ws.channels.base import BaseChannel
+
+class PingChannel(BaseChannel):
+    """Channel for sending ping requests to keep the connection alive."""
+    
+    def __init__(self, api):
+        """Initialize the ping channel.
+        
+        Args:
+            api: The ExpertOption API instance.
+        """
+        super().__init__(api)
+        self.logger = logging.getLogger("PingChannel")
+    
+    async def send(self, api, message: Dict[str, Any]) -> Dict:
+        """Send a ping request.
+        
+        Args:
+            api: The ExpertOption API instance.
+            message: The message payload for the ping request.
+        
+        Returns:
+            The response from the server.
+        """
+        payload = {
+            "action": "ping",
+            "message": message,
+            "token": api.token,
+            "ns": str(uuid4())
+        }
+        self.logger.debug(f"Sending ping request: {payload}")
+        await api.websocket_client.send(payload)
+        response = await api.websocket_client.recv("ping", timeout=10.0)
+        self.logger.debug(f"Received ping response: {response}")
+        return response
+    
+    async def __call__(self):
+        """Send a ping request with an empty message."""
+        return await self.send(self.api, {})
+
+############################################################
+# Expert/ws/channels/traders_choice.py
+############################################################
+"""Traders Choice channel for the ExpertOption API."""
+from Expert.ws.channels.base import BaseChannel
+from Expert.exceptions import InvalidAssetError
+from Expert.utils import validate_asset_id
+
+class TradersChoiceChannel(BaseChannel):
+    """Channel for fetching traders' choice data (put/call ratio)."""
+    
+    name = "traders_choice"
+    
+    async def __call__(self, asset_id: int):
+        """Fetch traders' choice data for a specific asset.
+        
+        Args:
+            asset_id: The ID of the asset.
+        
+        Returns:
+            The traders' choice data response.
+        
+        Raises:
+            InvalidAssetError: If the asset is not active.
+        """
+        if not validate_asset_id(asset_id, self.api.active_assets):
+            raise InvalidAssetError(f"Asset ID {asset_id} is not active")
+        
+        message = {
+            "assets": [asset_id]
+        }
+        return await self.send_request("tradersChoice", message)
+
+############################################################
+# Expert/ws/objects/base.py
+############################################################
+"""Base class for ExpertOption WebSocket objects."""
+from typing import Optional
+
+class BaseObject:
+    """Base class for ExpertOption WebSocket objects."""
+    
+    def __init__(self):
+        self.__name: Optional[str] = None
+    
+    @property
+    def name(self) -> str:
+        """Get the name of the WebSocket object.
+        
+        Returns:
+            The name of the object.
+        """
+        return self.__name
+
+############################################################
+# Expert/ws/objects/candles.py
+############################################################
+"""Candles object for the ExpertOption API."""
+from typing import List
+from Expert.ws.objects.base import BaseObject
+
+class Candle:
+    """Object for storing a single candle's data."""
+    
+    def __init__(self, candle_data: List[float]):
+        """Initialize the candle object.
+        
+        Args:
+            candle_data: List containing [open, high, low, close] values.
+        """
+        self.__open = candle_data[0]
+        self.__high = candle_data[1]
+        self.__low = candle_data[2]
+        self.__close = candle_data[3]
+    
+    @property
+    def open(self) -> float:
+        """Get the open price."""
+        return self.__open
+    
+    @property
+    def high(self) -> float:
+        """Get the high price."""
+        return self.__high
+    
+    @property
+    def low(self) -> float:
+        """Get the low price."""
+        return self.__low
+    
+    @property
+    def close(self) -> float:
+        """Get the close price."""
+        return self.__close
+    
+    @property
+    def type(self) -> str:
+        """Get the candle type (green or red).
+        
+        Returns:
+            'green' if close > open, 'red' if close < open, 'neutral' otherwise.
+        """
+        if self.__close > self.__open:
+            return "green"
+        if self.__close < self.__open:
+            return "red"
+        return "neutral"
+
+class Candles(BaseObject):
+    """Object for storing candle data for an asset."""
+    
+    def __init__(self):
+        super().__init__()
+        self.__name = "candles"
+        self.__candles_data: dict = {}
+    
+    @property
+    def candles_data(self) -> dict:
+        """Get the candles data.
+        
+        Returns:
+            Dictionary containing candle data.
+        """
+        return self.__candles_data
+    
+    @candles_data.setter
+    def candles_data(self, data: dict):
+        """Set the candles data."""
+        self.__candles_data = data
+    
+    def get_candle(self, index: int) -> Candle:
+        """Get a specific candle by index.
+        
+        Args:
+            index: The index of the candle.
+        
+        Returns:
+            The candle object.
+        """
+        periods = self.__candles_data.get("candles", [[]])[0].get("periods", [[]])[1]
+        return Candle(periods[index]) if periods else None
+
+############################################################
+# Expert/ws/objects/order.py
+############################################################
+"""Order object for the ExpertOption API."""
+from Expert.ws.objects.base import BaseObject
+
+class Order(BaseObject):
+    """Object for storing trading order data."""
+    
+    def __init__(self):
+        super().__init__()
+        self.__name = "order"
+        self.__order_id: int = None
+        self.__asset_id: int = None
+        self.__amount: float = None
+        self.__direction: str = None
+        self.__strike_time: int = None
+        self.__exp_time: int = None
+        self.__profit: float = None
+        self.__status: int = None
+    
+    @property
+    def order_id(self) -> int:
+        """Get the order ID."""
+        return self.__order_id
+    
+    @order_id.setter
+    def order_id(self, value: int):
+        """Set the order ID."""
+        self.__order_id = value
+    
+    @property
+    def asset_id(self) -> int:
+        """Get the asset ID."""
+        return self.__asset_id
+    
+    @asset_id.setter
+    def asset_id(self, value: int):
+        """Set the asset ID."""
+        self.__asset_id = value
+    
+    @property
+    def amount(self) -> float:
+        """Get the investment amount."""
+        return self.__amount
+    
+    @amount.setter
+    def amount(self, value: float):
+        """Set the investment amount."""
+        self.__amount = value
+    
+    @property
+    def direction(self) -> str:
+        """Get the trade direction ('call' or 'put')."""
+        return self.__direction
+    
+    @direction.setter
+    def direction(self, value: str):
+        """Set the trade direction."""
+        self.__direction = value
+    
+    @property
+    def strike_time(self) -> int:
+        """Get the strike time."""
+        return self.__strike_time
+    
+    @strike_time.setter
+    def strike_time(self, value: int):
+        """Set the strike time."""
+        self.__strike_time = value
+    
+    @property
+    def exp_time(self) -> int:
+        """Get the expiration time."""
+        return self.__exp_time
+    
+    @exp_time.setter
+    def exp_time(self, value: int):
+        """Set the expiration time."""
+        self.__exp_time = value
+    
+    @property
+    def profit(self) -> float:
+        """Get the profit amount."""
+        return self.__profit
+    
+    @profit.setter
+    def profit(self, value: float):
+        """Set the profit amount."""
+        self.__profit = value
+    
+    @property
+    def status(self) -> int:
+        """Get the order status (1 for closed, 0 for open)."""
+        return self.__status
+    
+    @status.setter
+    def status(self, value: int):
+        """Set the order status."""
+        self.__status = value
+
+############################################################
+# Expert/ws/objects/profile.py
+############################################################
+"""Profile object for the ExpertOption API."""
+from Expert.ws.objects.base import BaseObject
+
+class Profile(BaseObject):
+    """Object for storing user profile data."""
+    
+    def __init__(self):
+        super().__init__()
+        self.__name = "profile"
+        self.__demo_balance: float = 0.0
+        self.__real_balance: float = 0.0
+        self.__user_id: int = None
+        self.__nickname: str = None
+    
+    @property
+    def demo_balance(self) -> float:
+        """Get the demo balance.
+        
+        Returns:
+            The demo balance.
+        """
+        return self.__demo_balance
+    
+    @demo_balance.setter
+    def demo_balance(self, value: float):
+        """Set the demo balance."""
+        self.__demo_balance = value
+    
+    @property
+    def real_balance(self) -> float:
+        """Get the real balance.
+        
+        Returns:
+            The real balance.
+        """
+        return self.__real_balance
+    
+    @real_balance.setter
+    def real_balance(self, value: float):
+        """Set the real balance."""
+        self.__real_balance = value
+    
+    @property
+    def user_id(self) -> int:
+        """Get the user ID.
+        
+        Returns:
+            The user ID.
+        """
+        return self.__user_id
+    
+    @user_id.setter
+    def user_id(self, value: int):
+        """Set the user ID."""
+        self.__user_id = value
+    
+    @property
+    def nickname(self) -> str:
+        """Get the nickname.
+        
+        Returns:
+            The nickname.
+        """
+        return self.__nickname
+    
+    @nickname.setter
+    def nickname(self, value: str):
+        """Set the nickname."""
+        self.__nickname = value
+
+############################################################
+# EXAMPLE TEST 1
+############################################################
+import asyncio
+import logging
+from Expert.api import ExpertOptionAPI
+from Expert.indicators import AlligatorIndicator, RSIIndicator
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+async def main():
+    # Initialize API client
+    token = "78721b29ac2b9b60f3c1c1c9f713564f"  # Replace with new token if necessary
+    api = ExpertOptionAPI(token=token, demo=True, server_region="wss://fr24g1us.expertoption.finance/ws/v40")
+    
+    try:
+        # Connect to the server
+        await api.connect()
+        
+        # Fetch and print balance
+        balance = api.get_balance()
+        print(f"Account balance: {balance}")
+        
+        # Fetch and print active assets
+        print(f"Active assets: {len(api.active_assets)}")
+        print(f"Active asset IDs: {list(api.active_assets.keys())}")
+        
+        # Select an asset dynamically based on highest profit for type 1 assets
+        selected_asset_id = 240  # Default to Smarty (high profit)
+        # Filter for type 1 assets (with profit) and active status
+        available_assets = [
+            (asset_id, asset["profit"]) 
+            for asset_id, asset in api.active_assets.items() 
+            if asset.get("is_active") == 1 and asset.get("type") == 1 and "profit" in asset
+        ]
+        if available_assets:
+            selected_asset_id = max(available_assets, key=lambda x: x[1])[0]  # Choose asset with highest profit
+            print(f"Selected asset ID: {selected_asset_id}, Name: {api.active_assets[selected_asset_id]['name']}, Profit: {api.active_assets[selected_asset_id]['profit']}")
+        else:
+            raise ValueError("No active type 1 assets with profit available")
+        
+        # Subscribe to candles for the selected asset
+        await api.get_candles(selected_asset_id, timeframes=[0, 5])  # Use timeframes from ExpertOptionApiV2
+        candle_data = api.candle_cache.get(selected_asset_id)
+        print(f"Candle data for {api.active_assets[selected_asset_id]['name']}: {candle_data}")
+        
+        # Place a test order
+        order_id = await api.place_order(selected_asset_id, amount=1.0, direction="call")
+        print(f"Placed order ID: {order_id}")
+        
+        # Check order status
+        order = await api.check_order_status(order_id)
+        print(f"Order status: {order.status}, Profit: {order.profit}")
+        
+        # Fetch historical candles
+        periods = [[1744822016, 1744822726]]  # Example period
+        historical_candles = await api.get_historical_candles(selected_asset_id, periods)
+        print(f"Historical candles: {historical_candles}")
+        
+        # Test Alligator Indicator
+        alligator = AlligatorIndicator(historical_candles)
+        signal = await alligator.evaluate_market_trend(api, asset_id=selected_asset_id)
+        print(f"Alligator signal: {signal}")
+        
+        # Test RSI Indicator
+        rsi = RSIIndicator(historical_candles)
+        rsi_signal = rsi.evaluate_market_condition()
+        print(f"RSI signal: {rsi_signal}")
+        
+        # Fetch traders' choice
+        traders_choice = await api.get_traders_choice(selected_asset_id)
+        print(f"Traders' choice for {api.active_assets[selected_asset_id]['name']}: {traders_choice}")
+        
+    except ValueError as e:
+        print(f"Error: {str(e)}")
+        api.logger.error(f"Main execution failed: {str(e)}", exc_info=True)
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        api.logger.error(f"Main execution failed: {str(e)}", exc_info=True)
+    finally:
+        await api.disconnect()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+############################################################
