@@ -39,7 +39,7 @@ from Expert.indicators import AlligatorIndicator, RSIIndicator
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 async def main():
-    token = "78721b29ac2b9b60f3c1c1c9f713564f"  # Replace with your token
+    token = ""  # Replace with your token
     api = ExpertOptionAPI(token=token, demo=True, server_region="wss://fr24g1us.expertoption.finance/ws/v40")
     
     try:
